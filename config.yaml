@@ -1,0 +1,49 @@
+seed_everything: 42
+
+trainer:
+  accelerator: auto
+  devices: auto
+  max_epochs: 20
+  precision: bf16-mixed
+  log_every_n_steps: 50
+  default_root_dir: outputs
+  logger:
+    class_path: lightning.pytorch.loggers.CSVLogger
+    init_args:
+      save_dir: outputs/logs
+      name: cifar10_swin
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val_acc
+        mode: max
+        save_top_k: 1
+        filename: swin-cifar10-{epoch:02d}-{val_acc:.4f}
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: epoch
+
+model:
+  num_classes: 10
+  image_size: 32
+  patch_size: 4
+  in_channels: 3
+  embed_dim: 64
+  depths: [2, 2, 2, 2]
+  num_heads: [2, 4, 8, 16]
+  window_size: 4
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.1
+  learning_rate: 0.001
+  weight_decay: 0.05
+
+data:
+  data_dir: data
+  batch_size: 128
+  num_workers: 4
+  image_size: 32
+  val_split: 5000
+  seed: 42
+  download: true
