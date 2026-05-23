@@ -55,9 +55,113 @@ class Mlp(nn.Module):
         return x
 
 
+class DroplessMoEMlp(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        num_experts: int,
+        top_k: int = 2,
+        drop: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if num_experts <= 0:
+            raise ValueError("num_experts must be greater than 0.")
+        if top_k <= 0 or top_k > num_experts:
+            raise ValueError("top_k must be in the range [1, num_experts].")
+
+        self.in_features = in_features
+        self.hidden_features = hidden_features
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+        self.router = nn.Linear(in_features, num_experts, bias=False)
+        # grouped_mm operand layout avoids per-forward transpose: x @ w1 maps D -> H, h @ w2 maps H -> D.
+        self.w1 = nn.Parameter(torch.empty(num_experts, in_features, hidden_features))
+        self.b1 = nn.Parameter(torch.zeros(num_experts, hidden_features))
+        self.w2 = nn.Parameter(torch.empty(num_experts, hidden_features, in_features))
+        self.b2 = nn.Parameter(torch.zeros(num_experts, in_features))
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(drop)
+        self.aux_loss: Tensor | None = None
+        self.z_loss: Tensor | None = None
+
+        nn.init.trunc_normal_(self.w1, std=0.02)
+        nn.init.trunc_normal_(self.w2, std=0.02)
+
+    def _apply(self, fn):
+        module = super()._apply(fn)
+        self.router.float()
+        return module
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not x.is_cuda:
+            raise RuntimeError("DroplessMoEMlp requires CUDA tensors because it uses torch.nn.functional.grouped_mm.")
+        if not hasattr(F, "grouped_mm"):
+            raise RuntimeError("torch.nn.functional.grouped_mm is not available in this PyTorch build.")
+        if self.router.weight.dtype != torch.float32:
+            raise RuntimeError("Router weights must remain FP32 for stable routing.")
+
+        orig_shape = x.shape
+        x = x.reshape(-1, self.in_features)
+        tokens = x.shape[0]
+
+        # Keep routing numerics in FP32; expert grouped_mm below still uses the activation dtype.
+        with torch.autocast(device_type="cuda", enabled=False):
+            logits = self.router(x.float())
+            probs = F.softmax(logits, dim=-1)
+            topk_prob, topk_expert = torch.topk(probs, k=self.top_k, dim=-1)
+            topk_gate = topk_prob / topk_prob.sum(dim=-1, keepdim=True)
+
+        flat_expert = topk_expert.reshape(-1)
+        flat_gate = topk_gate.reshape(-1)
+        flat_token = torch.arange(tokens, device=x.device).repeat_interleave(self.top_k)
+
+        order = torch.argsort(flat_expert)
+        expert_sorted = flat_expert[order]
+        token_sorted = flat_token[order]
+        gate_sorted = flat_gate[order]
+        x_sorted = x.index_select(0, token_sorted)
+
+        counts = torch.bincount(expert_sorted, minlength=self.num_experts)
+        offsets = torch.cumsum(counts, dim=0).to(torch.int32)
+        tokens_per_expert = counts.to(probs.dtype) / counts.sum().to(probs.dtype)
+        prob_per_expert = probs.mean(dim=0)
+        self.aux_loss = self.num_experts * torch.sum(tokens_per_expert * prob_per_expert)
+        self.z_loss = torch.mean(torch.logsumexp(logits, dim=-1).square())
+
+        w1 = self.w1 if self.w1.dtype == x.dtype else self.w1.to(dtype=x.dtype)
+
+        # grouped_mm requires offs[-1] < mat_a.shape[0], so append one ignored row.
+        padding = torch.zeros(1, x_sorted.shape[-1], dtype=x_sorted.dtype, device=x_sorted.device)
+        x_grouped = torch.cat((x_sorted, padding), dim=0)
+        h = F.grouped_mm(x_grouped, w1, offs=offsets)[: x_sorted.shape[0]]
+        h = h + self.b1.index_select(0, expert_sorted).to(dtype=h.dtype)
+        h = self.act(h)
+        h = self.drop(h)
+
+        w2 = self.w2 if self.w2.dtype == h.dtype else self.w2.to(dtype=h.dtype)
+
+        # grouped_mm requires offs[-1] < mat_a.shape[0], so append one ignored row.
+        hidden_padding = torch.zeros(1, h.shape[-1], dtype=h.dtype, device=h.device)
+        h_grouped = torch.cat((h, hidden_padding), dim=0)
+        y_sorted = F.grouped_mm(h_grouped, w2, offs=offsets)[: h.shape[0]]
+        y_sorted = y_sorted + self.b2.index_select(0, expert_sorted).to(dtype=y_sorted.dtype)
+        y_sorted = self.drop(y_sorted)
+        y_sorted = y_sorted * gate_sorted.unsqueeze(-1).to(dtype=y_sorted.dtype)
+
+        y = torch.zeros_like(x)
+        y.index_add_(0, token_sorted, y_sorted.to(dtype=y.dtype))
+        return y.reshape(orig_shape)
+
+
 class WindowAttention(nn.Module):
     def __init__(self, dim: int, window_size: int, num_heads: int, qkv_bias: bool = True, attn_drop: float = 0.0, proj_drop: float = 0.0) -> None:
         super().__init__()
+        if num_heads <= 0:
+            raise ValueError("num_heads must be greater than 0.")
+        if dim % num_heads != 0:
+            raise ValueError("dim must be divisible by num_heads.")
         self.dim = dim
         self.window_size = window_size
         self.num_heads = num_heads
@@ -121,18 +225,27 @@ class SwinTransformerBlock(nn.Module):
         drop: float = 0.0,
         attn_drop: float = 0.0,
         drop_path: float = 0.0,
+        use_moe_mlp: bool = False,
+        moe_num_experts: int = 4,
+        moe_top_k: int = 2,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
         self.window_size = min(window_size, input_resolution[0], input_resolution[1])
+        if input_resolution[0] % self.window_size != 0 or input_resolution[1] % self.window_size != 0:
+            raise ValueError("input_resolution must be divisible by window_size, or padding is required.")
         self.shift_size = 0 if min(input_resolution) <= self.window_size else shift_size
 
         self.norm1 = nn.LayerNorm(dim)
         self.attn = WindowAttention(dim, self.window_size, num_heads, attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = Mlp(dim, int(dim * mlp_ratio), drop=drop)
+        hidden_features = int(dim * mlp_ratio)
+        if use_moe_mlp:
+            self.mlp = DroplessMoEMlp(dim, hidden_features, num_experts=moe_num_experts, top_k=moe_top_k, drop=drop)
+        else:
+            self.mlp = Mlp(dim, hidden_features, drop=drop)
 
         self.register_buffer("attn_mask", self._create_mask(), persistent=False)
 
@@ -222,6 +335,9 @@ class BasicLayer(nn.Module):
         attn_drop: float,
         drop_path: Sequence[float],
         downsample: bool,
+        use_moe_mlp: bool,
+        moe_num_experts: int,
+        moe_top_k: int,
     ) -> None:
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -236,11 +352,26 @@ class BasicLayer(nn.Module):
                     drop=drop,
                     attn_drop=attn_drop,
                     drop_path=drop_path[index],
+                    use_moe_mlp=use_moe_mlp,
+                    moe_num_experts=moe_num_experts,
+                    moe_top_k=moe_top_k,
                 )
                 for index in range(depth)
             ]
         )
         self.downsample = PatchMerging(input_resolution, dim) if downsample else None
+
+    def moe_loss(self) -> Tensor | None:
+        losses = [block.mlp.aux_loss for block in self.blocks if isinstance(block.mlp, DroplessMoEMlp) and block.mlp.aux_loss is not None]
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
+    def moe_z_loss(self) -> Tensor | None:
+        losses = [block.mlp.z_loss for block in self.blocks if isinstance(block.mlp, DroplessMoEMlp) and block.mlp.z_loss is not None]
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
 
     def forward(self, x: Tensor) -> Tensor:
         for block in self.blocks:
@@ -283,12 +414,19 @@ class SwinTransformer(nn.Module):
         drop_rate: float = 0.0,
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.1,
+        moe_stages: Sequence[int] = (0, 1),
+        moe_num_experts: int = 4,
+        moe_top_k: int = 2,
     ) -> None:
         super().__init__()
         if image_size % patch_size != 0:
             raise ValueError("image_size must be divisible by patch_size.")
         if len(depths) != len(num_heads):
             raise ValueError("depths and num_heads must have the same length.")
+        moe_stage_set = set(moe_stages)
+        invalid_moe_stages = moe_stage_set.difference(range(len(depths)))
+        if invalid_moe_stages:
+            raise ValueError(f"moe_stages contains invalid stage indices: {sorted(invalid_moe_stages)}.")
 
         self.num_layers = len(depths)
         self.num_features = embed_dim * 2 ** (self.num_layers - 1)
@@ -315,6 +453,9 @@ class SwinTransformer(nn.Module):
                 attn_drop=attn_drop_rate,
                 drop_path=drop_paths[depth_offset : depth_offset + depths[layer_index]],
                 downsample=layer_index < self.num_layers - 1,
+                use_moe_mlp=layer_index in moe_stage_set,
+                moe_num_experts=moe_num_experts,
+                moe_top_k=moe_top_k,
             )
             self.layers.append(layer)
             depth_offset += depths[layer_index]
@@ -343,6 +484,20 @@ class SwinTransformer(nn.Module):
         x = x.mean(dim=1)
         return self.head(x)
 
+    def moe_loss(self) -> Tensor | None:
+        losses = [layer.moe_loss() for layer in self.layers]
+        losses = [loss for loss in losses if loss is not None]
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
+    def moe_z_loss(self) -> Tensor | None:
+        losses = [layer.moe_z_loss() for layer in self.layers]
+        losses = [loss for loss in losses if loss is not None]
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
 
 class SwinCIFAR10Classifier(pl.LightningModule):
     def __init__(
@@ -359,6 +514,11 @@ class SwinCIFAR10Classifier(pl.LightningModule):
         drop_rate: float = 0.0,
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.1,
+        moe_stages: Sequence[int] = (0, 1),
+        moe_num_experts: int = 4,
+        moe_top_k: int = 2,
+        moe_aux_loss_weight: float = 0.01,
+        moe_z_loss_weight: float = 0.001,
         learning_rate: float = 0.001,
         weight_decay: float = 0.05,
     ) -> None:
@@ -377,6 +537,9 @@ class SwinCIFAR10Classifier(pl.LightningModule):
             drop_rate=drop_rate,
             attn_drop_rate=attn_drop_rate,
             drop_path_rate=drop_path_rate,
+            moe_stages=moe_stages,
+            moe_num_experts=moe_num_experts,
+            moe_top_k=moe_top_k,
         )
         self.criterion = nn.CrossEntropyLoss()
         self.train_acc = MulticlassAccuracy(num_classes=num_classes)
@@ -390,6 +553,16 @@ class SwinCIFAR10Classifier(pl.LightningModule):
         images, targets = batch
         logits = self(images)
         loss = self.criterion(logits, targets)
+        moe_aux_loss = self.model.moe_loss()
+        if moe_aux_loss is not None:
+            self.log(f"{stage}_moe_aux_loss", moe_aux_loss, prog_bar=False, on_step=stage == "train", on_epoch=True)
+            if stage == "train" and self.hparams.moe_aux_loss_weight > 0.0:
+                loss = loss + self.hparams.moe_aux_loss_weight * moe_aux_loss
+        moe_z_loss = self.model.moe_z_loss()
+        if moe_z_loss is not None:
+            self.log(f"{stage}_moe_z_loss", moe_z_loss, prog_bar=False, on_step=stage == "train", on_epoch=True)
+            if stage == "train" and self.hparams.moe_z_loss_weight > 0.0:
+                loss = loss + self.hparams.moe_z_loss_weight * moe_z_loss
         preds = torch.argmax(logits, dim=1)
         metric = getattr(self, f"{stage}_acc")
         metric(preds, targets)
