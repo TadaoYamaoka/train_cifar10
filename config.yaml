@@ -5,13 +5,6 @@ trainer:
   devices: auto
   max_epochs: 20
   precision: bf16-mixed
-  log_every_n_steps: 50
-  default_root_dir: outputs
-  logger:
-    class_path: lightning.pytorch.loggers.CSVLogger
-    init_args:
-      save_dir: outputs/logs
-      name: cifar10_swin
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
