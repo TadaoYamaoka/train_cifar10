@@ -1,4 +1,8 @@
+.vscode/
 data/
 __pycache__/
 outputs/
 lightning_logs/
+artifacts/
+build/
+build_plugin/
