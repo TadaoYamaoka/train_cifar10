@@ -5,6 +5,17 @@
 #include <stdint.h>
 #include <type_traits>
 
+#if defined(USE_CUTLASS_GROUPED_GEMM)
+#include <cutlass/arch/arch.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/gemm/device/gemm_grouped.h>
+#include <cutlass/gemm/kernel/default_gemm_grouped.h>
+#include <cutlass/gemm/threadblock/threadblock_swizzle.h>
+#include <cutlass/layout/matrix.h>
+#include <cutlass/numeric_types.h>
+#endif
+
 namespace {
 
 constexpr int kMaxExperts = 128;
@@ -67,6 +78,18 @@ struct WorkspaceParts {
     float* gate_sorted;
     void* x_sorted;
     void* h_sorted;
+    void* y_sorted;
+#if defined(USE_CUTLASS_GROUPED_GEMM)
+    void* problem_sizes;
+    void* ptr_a;
+    void* ptr_b;
+    void* ptr_c;
+    void* ptr_d;
+    int64_t* lda;
+    int64_t* ldb;
+    int64_t* ldc;
+    int64_t* ldd;
+#endif
 };
 
 WorkspaceParts splitWorkspace(void* workspace, const CustomMoeConfig& cfg, int64_t M, nvinfer1::DataType dtype) {
@@ -92,6 +115,18 @@ WorkspaceParts splitWorkspace(void* workspace, const CustomMoeConfig& cfg, int64
     size_t elt = dtype == nvinfer1::DataType::kHALF ? sizeof(__half) : sizeof(float);
     w.x_sorted = take(elt * N * cfg.in_features);
     w.h_sorted = take(elt * N * cfg.hidden_features);
+    w.y_sorted = take(elt * N * cfg.in_features);
+#if defined(USE_CUTLASS_GROUPED_GEMM)
+    w.problem_sizes = take(sizeof(cutlass::gemm::GemmCoord) * cfg.num_experts);
+    w.ptr_a = take(sizeof(void*) * cfg.num_experts);
+    w.ptr_b = take(sizeof(void*) * cfg.num_experts);
+    w.ptr_c = take(sizeof(void*) * cfg.num_experts);
+    w.ptr_d = take(sizeof(void*) * cfg.num_experts);
+    w.lda = reinterpret_cast<int64_t*>(take(sizeof(int64_t) * cfg.num_experts));
+    w.ldb = reinterpret_cast<int64_t*>(take(sizeof(int64_t) * cfg.num_experts));
+    w.ldc = reinterpret_cast<int64_t*>(take(sizeof(int64_t) * cfg.num_experts));
+    w.ldd = reinterpret_cast<int64_t*>(take(sizeof(int64_t) * cfg.num_experts));
+#endif
     return w;
 }
 
@@ -275,6 +310,238 @@ __global__ void fc2CombineKernel(
 }
 
 template <typename T>
+__global__ void addBiasGeluKernel(
+    T* __restrict__ h_sorted,
+    const T* __restrict__ b1,
+    const int* __restrict__ expert_sorted,
+    int64_t N,
+    int H) {
+    int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = N * static_cast<int64_t>(H);
+    if (linear >= total) return;
+    int h = static_cast<int>(linear % H);
+    int64_t row = linear / H;
+    int e = expert_sorted[row];
+    float v = readScalar<T>(h_sorted + linear) + readScalar<T>(b1 + static_cast<int64_t>(e) * H + h);
+    h_sorted[linear] = writeScalar<T>(geluExact(v));
+}
+
+template <typename T>
+__global__ void addBiasGateCombineKernel(
+    const T* __restrict__ y_sorted,
+    const T* __restrict__ b2,
+    const int* __restrict__ token_sorted,
+    const int* __restrict__ expert_sorted,
+    const float* __restrict__ gate_sorted,
+    T* __restrict__ y,
+    int64_t N,
+    int D) {
+    int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = N * static_cast<int64_t>(D);
+    if (linear >= total) return;
+    int d = static_cast<int>(linear % D);
+    int64_t row = linear / D;
+    int e = expert_sorted[row];
+    int token = token_sorted[row];
+    float v = readScalar<T>(y_sorted + linear) + readScalar<T>(b2 + static_cast<int64_t>(e) * D + d);
+    v *= gate_sorted[row];
+    atomicAddScalar<T>(y + static_cast<int64_t>(token) * D + d, v);
+}
+
+#if defined(USE_CUTLASS_GROUPED_GEMM)
+using CutlassElement = cutlass::half_t;
+using CutlassLayout = cutlass::layout::RowMajor;
+using CutlassAccumulator = float;
+using CutlassOpClass = cutlass::arch::OpClassTensorOp;
+using CutlassArch = cutlass::arch::Sm80;
+using CutlassThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;
+using CutlassWarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
+using CutlassInstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+using CutlassEpilogueOp = cutlass::epilogue::thread::LinearCombination<
+    CutlassElement,
+    8,
+    CutlassAccumulator,
+    CutlassAccumulator>;
+using CutlassSwizzle = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
+using CutlassGroupedKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
+    CutlassElement,
+    CutlassLayout,
+    cutlass::ComplexTransform::kNone,
+    8,
+    CutlassElement,
+    CutlassLayout,
+    cutlass::ComplexTransform::kNone,
+    8,
+    CutlassElement,
+    CutlassLayout,
+    CutlassAccumulator,
+    CutlassOpClass,
+    CutlassArch,
+    CutlassThreadblockShape,
+    CutlassWarpShape,
+    CutlassInstructionShape,
+    CutlassEpilogueOp,
+    CutlassSwizzle,
+    3,
+    cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>::GemmKernel;
+using CutlassGroupedGemm = cutlass::gemm::device::GemmGrouped<CutlassGroupedKernel>;
+
+__global__ void setupGroupedGemmMetaKernel(
+    const int* __restrict__ offsets,
+    const __half* __restrict__ a_base,
+    const __half* __restrict__ b_base,
+    __half* __restrict__ c_base,
+    __half* __restrict__ d_base,
+    cutlass::gemm::GemmCoord* __restrict__ problem_sizes,
+    CutlassElement** __restrict__ ptr_a,
+    CutlassElement** __restrict__ ptr_b,
+    CutlassElement** __restrict__ ptr_c,
+    CutlassElement** __restrict__ ptr_d,
+    int64_t* __restrict__ lda,
+    int64_t* __restrict__ ldb,
+    int64_t* __restrict__ ldc,
+    int64_t* __restrict__ ldd,
+    int E,
+    int Kdim,
+    int Ndim) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= E) return;
+    int begin = offsets[e];
+    int end = offsets[e + 1];
+    int rows = end - begin;
+    problem_sizes[e] = cutlass::gemm::GemmCoord(rows, Ndim, Kdim);
+    ptr_a[e] = reinterpret_cast<CutlassElement*>(const_cast<__half*>(a_base + static_cast<int64_t>(begin) * Kdim));
+    ptr_b[e] = reinterpret_cast<CutlassElement*>(const_cast<__half*>(b_base + static_cast<int64_t>(e) * Kdim * Ndim));
+    ptr_c[e] = reinterpret_cast<CutlassElement*>(c_base + static_cast<int64_t>(begin) * Ndim);
+    ptr_d[e] = reinterpret_cast<CutlassElement*>(d_base + static_cast<int64_t>(begin) * Ndim);
+    lda[e] = Kdim;
+    ldb[e] = Ndim;
+    ldc[e] = Ndim;
+    ldd[e] = Ndim;
+}
+
+cudaError_t runCutlassGroupedGemm(
+    WorkspaceParts& ws,
+    int E,
+    int Kdim,
+    int Ndim,
+    const __half* a_base,
+    const __half* b_base,
+    __half* c_base,
+    __half* d_base,
+    cudaStream_t stream) {
+    const int meta_threads = 128;
+    setupGroupedGemmMetaKernel<<<static_cast<unsigned>((E + meta_threads - 1) / meta_threads), meta_threads, 0, stream>>>(
+        ws.offsets,
+        a_base,
+        b_base,
+        c_base,
+        d_base,
+        static_cast<cutlass::gemm::GemmCoord*>(ws.problem_sizes),
+        static_cast<CutlassElement**>(ws.ptr_a),
+        static_cast<CutlassElement**>(ws.ptr_b),
+        static_cast<CutlassElement**>(ws.ptr_c),
+        static_cast<CutlassElement**>(ws.ptr_d),
+        ws.lda,
+        ws.ldb,
+        ws.ldc,
+        ws.ldd,
+        E,
+        Kdim,
+        Ndim);
+    cudaError_t setup_error = cudaGetLastError();
+    if (setup_error != cudaSuccess) return setup_error;
+
+    int threadblock_count = CutlassGroupedGemm::sufficient(nullptr, 0);
+    typename CutlassGroupedGemm::Arguments args(
+        static_cast<cutlass::gemm::GemmCoord*>(ws.problem_sizes),
+        E,
+        threadblock_count,
+        typename CutlassGroupedGemm::EpilogueOutputOp::Params(1.0f, 0.0f),
+        static_cast<CutlassElement**>(ws.ptr_a),
+        static_cast<CutlassElement**>(ws.ptr_b),
+        static_cast<CutlassElement**>(ws.ptr_c),
+        static_cast<CutlassElement**>(ws.ptr_d),
+        ws.lda,
+        ws.ldb,
+        ws.ldc,
+        ws.ldd);
+    CutlassGroupedGemm gemm;
+    cutlass::Status status = gemm(args, nullptr, stream);
+    if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+    return cudaGetLastError();
+}
+
+cudaError_t enqueueTypedCutlassHalf(
+    const CustomMoeConfig& cfg,
+    int64_t M,
+    const void* x_void,
+    const float* router_w,
+    const void* w1_void,
+    const void* b1_void,
+    const void* w2_void,
+    const void* b2_void,
+    void* y_void,
+    void* workspace,
+    cudaStream_t stream) {
+    const __half* x = static_cast<const __half*>(x_void);
+    const __half* w1 = static_cast<const __half*>(w1_void);
+    const __half* b1 = static_cast<const __half*>(b1_void);
+    const __half* w2 = static_cast<const __half*>(w2_void);
+    const __half* b2 = static_cast<const __half*>(b2_void);
+    __half* y = static_cast<__half*>(y_void);
+
+    WorkspaceParts ws = splitWorkspace(workspace, cfg, M, nvinfer1::DataType::kHALF);
+    const int64_t N = M * cfg.top_k;
+    const int threads = 256;
+
+    cudaMemsetAsync(ws.counts, 0, sizeof(int) * cfg.num_experts, stream);
+    cudaMemsetAsync(y, 0, sizeof(__half) * M * cfg.in_features, stream);
+
+    routeTopKKernel<__half><<<static_cast<unsigned>((M + threads - 1) / threads), threads, 0, stream>>>(
+        x, router_w, ws.topk_experts, ws.topk_gates, M, cfg.in_features, cfg.num_experts, cfg.top_k);
+    countExpertsKernel<<<static_cast<unsigned>((N + threads - 1) / threads), threads, 0, stream>>>(
+        ws.topk_experts, ws.counts, N);
+    prefixAndResetKernel<<<1, 1, 0, stream>>>(ws.counts, ws.offsets, ws.write_ptr, cfg.num_experts);
+    packAssignmentsKernel<<<static_cast<unsigned>((N + threads - 1) / threads), threads, 0, stream>>>(
+        ws.topk_experts, ws.topk_gates, ws.write_ptr, ws.assignment_dst, ws.token_sorted,
+        ws.expert_sorted, ws.gate_sorted, M, cfg.top_k);
+    copyPackedXKernel<__half><<<static_cast<unsigned>((N * cfg.in_features + threads - 1) / threads), threads, 0, stream>>>(
+        x, ws.assignment_dst, static_cast<__half*>(ws.x_sorted), M, cfg.in_features, cfg.top_k);
+
+    cudaError_t err = runCutlassGroupedGemm(
+        ws,
+        cfg.num_experts,
+        cfg.in_features,
+        cfg.hidden_features,
+        static_cast<const __half*>(ws.x_sorted),
+        w1,
+        static_cast<__half*>(ws.h_sorted),
+        static_cast<__half*>(ws.h_sorted),
+        stream);
+    if (err != cudaSuccess) return err;
+    addBiasGeluKernel<__half><<<static_cast<unsigned>((N * cfg.hidden_features + threads - 1) / threads), threads, 0, stream>>>(
+        static_cast<__half*>(ws.h_sorted), b1, ws.expert_sorted, N, cfg.hidden_features);
+
+    err = runCutlassGroupedGemm(
+        ws,
+        cfg.num_experts,
+        cfg.hidden_features,
+        cfg.in_features,
+        static_cast<const __half*>(ws.h_sorted),
+        w2,
+        static_cast<__half*>(ws.y_sorted),
+        static_cast<__half*>(ws.y_sorted),
+        stream);
+    if (err != cudaSuccess) return err;
+    addBiasGateCombineKernel<__half><<<static_cast<unsigned>((N * cfg.in_features + threads - 1) / threads), threads, 0, stream>>>(
+        static_cast<__half*>(ws.y_sorted), b2, ws.token_sorted, ws.expert_sorted, ws.gate_sorted,
+        y, N, cfg.in_features);
+    return cudaGetLastError();
+}
+#endif
+
+template <typename T>
 cudaError_t enqueueTyped(
     const CustomMoeConfig& cfg,
     int64_t M,
@@ -341,6 +608,18 @@ size_t getCustomMoeWorkspaceSize(const CustomMoeConfig& cfg, int64_t token_count
     size_t elt = dtype == nvinfer1::DataType::kHALF ? sizeof(__half) : sizeof(float);
     add(elt * N * cfg.in_features);                // x_sorted
     add(elt * N * cfg.hidden_features);            // h_sorted
+    add(elt * N * cfg.in_features);                // y_sorted
+#if defined(USE_CUTLASS_GROUPED_GEMM)
+    add(sizeof(cutlass::gemm::GemmCoord) * cfg.num_experts); // problem_sizes
+    add(sizeof(void*) * cfg.num_experts);           // ptr_a
+    add(sizeof(void*) * cfg.num_experts);           // ptr_b
+    add(sizeof(void*) * cfg.num_experts);           // ptr_c
+    add(sizeof(void*) * cfg.num_experts);           // ptr_d
+    add(sizeof(int64_t) * cfg.num_experts);         // lda
+    add(sizeof(int64_t) * cfg.num_experts);         // ldb
+    add(sizeof(int64_t) * cfg.num_experts);         // ldc
+    add(sizeof(int64_t) * cfg.num_experts);         // ldd
+#endif
     return alignUp(off);
 }
 
@@ -361,7 +640,11 @@ cudaError_t enqueueCustomMoe(
         return cudaErrorInvalidValue;
     }
     if (dtype == nvinfer1::DataType::kHALF) {
+#if defined(USE_CUTLASS_GROUPED_GEMM)
+        return enqueueTypedCutlassHalf(cfg, token_count, x, router_w, w1, b1, w2, b2, y, workspace, stream);
+#else
         return enqueueTyped<__half>(cfg, token_count, x, router_w, w1, b1, w2, b2, y, workspace, stream);
+#endif
     }
     if (dtype == nvinfer1::DataType::kFLOAT) {
         return enqueueTyped<float>(cfg, token_count, x, router_w, w1, b1, w2, b2, y, workspace, stream);

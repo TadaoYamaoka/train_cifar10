@@ -13,6 +13,7 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 
 option(BUILD_CUSTOM_MOE_PLUGIN "Build the experimental CustomMoE TensorRT plugin" OFF)
+option(USE_CUTLASS_GROUPED_GEMM "Use CUTLASS grouped GEMM inside the CustomMoE plugin" OFF)
 
 set(TENSORRT_ROOT "" CACHE PATH "TensorRT installation prefix")
 if(NOT TENSORRT_ROOT AND DEFINED ENV{TENSORRT_ROOT})
@@ -40,10 +41,19 @@ message(STATUS "TensorRT include: ${TENSORRT_INCLUDE_DIR}")
 message(STATUS "TensorRT lib: ${TENSORRT_LIB}")
 
 if(BUILD_CUSTOM_MOE_PLUGIN)
+  if(USE_CUTLASS_GROUPED_GEMM AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include/cutlass/cutlass.h")
+    message(FATAL_ERROR "USE_CUTLASS_GROUPED_GEMM=ON requires third_party/cutlass. Clone CUTLASS into third_party/cutlass.")
+  endif()
   add_library(custom_moe_plugin SHARED
     plugins/custom_moe_plugin.cpp
     plugins/custom_moe_kernels.cu)
   target_include_directories(custom_moe_plugin PRIVATE ${TENSORRT_INCLUDE_DIR} plugins)
+  if(USE_CUTLASS_GROUPED_GEMM)
+    target_include_directories(custom_moe_plugin PRIVATE
+      third_party/cutlass/include
+      third_party/cutlass/tools/util/include)
+    target_compile_definitions(custom_moe_plugin PRIVATE USE_CUTLASS_GROUPED_GEMM=1)
+  endif()
   target_link_libraries(custom_moe_plugin PRIVATE CUDA::cudart ${TENSORRT_LIB} ${TENSORRT_PLUGIN_LIB})
   target_compile_options(custom_moe_plugin PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)

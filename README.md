@@ -68,3 +68,59 @@ std  = (0.2470, 0.2435, 0.2616)
 ```
 
 plugin 経路を試す場合は `--mode plugin` で ONNX を出力し、CMake に `-DBUILD_CUSTOM_MOE_PLUGIN=ON` を渡して `libcustom_moe_plugin.so` をビルドしてください。
+
+```bash
+python scripts/export_moe_onnx.py \
+	--checkpoint lightning_logs/version_1/checkpoints/swin-cifar10-epoch=19-val_acc=0.7693.ckpt \
+	--lightning-checkpoint \
+	--mode plugin \
+	--fp16-experts \
+	--output artifacts/swin_cifar10_plugin.onnx
+
+cmake -S . -B build_plugin \
+	-DCMAKE_CUDA_ARCHITECTURES=80 \
+	-DBUILD_CUSTOM_MOE_PLUGIN=ON
+cmake --build build_plugin -j
+
+python scripts/build_engine.py \
+	--onnx artifacts/swin_cifar10_plugin.onnx \
+	--engine artifacts/swin_cifar10_plugin.engine \
+	--plugin build_plugin/libcustom_moe_plugin.so \
+	--fp16 \
+	--min-batch 1 --opt-batch 8 --max-batch 32
+
+./build_plugin/moe_trt_infer \
+	--engine artifacts/swin_cifar10_plugin.engine \
+	--plugin build_plugin/libcustom_moe_plugin.so \
+	--batch 1 \
+	--warmup 20 \
+	--iters 100 \
+	--output artifacts/plugin_logits.bin
+```
+
+CUTLASS grouped GEMM 版の plugin を使う場合は、CUTLASS を `third_party/cutlass` に配置し、`-DUSE_CUTLASS_GROUPED_GEMM=ON` を追加します。この経路では routing/packing は既存 CUDA kernel のまま、FC1/FC2 を CUTLASS `GemmGrouped` で実行します。
+
+```bash
+git clone --depth 1 https://github.com/NVIDIA/cutlass.git third_party/cutlass
+
+cmake -S . -B build_cutlass \
+	-DCMAKE_CUDA_ARCHITECTURES=80 \
+	-DBUILD_CUSTOM_MOE_PLUGIN=ON \
+	-DUSE_CUTLASS_GROUPED_GEMM=ON
+cmake --build build_cutlass -j
+
+python scripts/build_engine.py \
+	--onnx artifacts/swin_cifar10_plugin.onnx \
+	--engine artifacts/swin_cifar10_plugin_cutlass.engine \
+	--plugin build_cutlass/libcustom_moe_plugin.so \
+	--fp16 \
+	--min-batch 1 --opt-batch 8 --max-batch 32
+
+./build_cutlass/moe_trt_infer \
+	--engine artifacts/swin_cifar10_plugin_cutlass.engine \
+	--plugin build_cutlass/libcustom_moe_plugin.so \
+	--batch 1 \
+	--warmup 20 \
+	--iters 100 \
+	--output artifacts/plugin_cutlass_logits.bin
+```
