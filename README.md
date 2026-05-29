@@ -124,3 +124,41 @@ python scripts/build_engine.py \
 	--iters 100 \
 	--output artifacts/plugin_cutlass_logits.bin
 ```
+
+## MoE TensorRT ベンチマーク
+
+Dense MoE、Sparse Plugin MoE、Sparse Plugin MoE (CUTLASS) を同条件で比較する場合は、batch 128 に合わせて TensorRT engine の optimization profile をそろえます。
+
+```bash
+python scripts/build_engine.py \
+	--onnx artifacts/swin_cifar10_dense.onnx \
+	--engine artifacts/bench_b128_dense.engine \
+	--fp16 \
+	--min-batch 1 --opt-batch 128 --max-batch 128
+
+python scripts/build_engine.py \
+	--onnx artifacts/swin_cifar10_plugin.onnx \
+	--engine artifacts/bench_b128_plugin.engine \
+	--plugin build_plugin/libcustom_moe_plugin.so \
+	--fp16 \
+	--min-batch 1 --opt-batch 128 --max-batch 128
+
+python scripts/build_engine.py \
+	--onnx artifacts/swin_cifar10_plugin.onnx \
+	--engine artifacts/bench_b128_plugin_cutlass.engine \
+	--plugin build_cutlass/libcustom_moe_plugin.so \
+	--fp16 \
+	--min-batch 1 --opt-batch 128 --max-batch 128
+```
+
+同じ runner、同じ batch、同じ warmup/iters、同じ CUDA Graph 設定で比較するには、次を実行します。
+
+```bash
+python scripts/benchmark_moe_trt.py --batch 128 --warmup 50 --iters 200
+```
+
+CUDA Graph を使わない場合は次のようにします。
+
+```bash
+python scripts/benchmark_moe_trt.py --batch 128 --warmup 50 --iters 200 --no-cuda-graph
+```
